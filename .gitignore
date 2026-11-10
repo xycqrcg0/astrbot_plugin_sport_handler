@@ -1,0 +1,35 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local credentials and activity templates
+.env
+.env.*
+!.env.example
+/session.key
+/secret
+/data.json
+
+# Worker dependencies and generated files
+node_modules/
+.pnpm-store/
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+/worker/dist/
+
+# Local logs and editor files
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

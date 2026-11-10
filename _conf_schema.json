@@ -1,0 +1,14 @@
+{
+  "worker_url": {
+    "description": "Cloudflare Worker 登录站点地址",
+    "type": "string",
+    "default": "",
+    "hint": "填写部署后的 HTTPS 根地址，例如 https://campus-login.example.workers.dev。留空时继续使用私聊登录。"
+  },
+  "worker_secret": {
+    "description": "Worker 通信密钥",
+    "type": "string",
+    "default": "",
+    "hint": "与 Worker 的 BOT_SECRET 保持一致，使用至少 32 个随机字符。不要发给用户或填写到前端代码中。"
+  }
+}

@@ -1,0 +1,8 @@
+name: astrbot_plugin_sport_handler
+display_name: 校园跑
+desc: 华科校园跑内置轨迹生成、多用户私聊及 Worker 网页登录、登录状态保存与单次提交，支持 LLM 工具。
+version: v1.0.0
+author: AstrBot User
+astrbot_version: ">=4.16.0"
+support_platforms: []
+repo: ""

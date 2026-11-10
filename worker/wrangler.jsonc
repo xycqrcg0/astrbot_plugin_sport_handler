@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "astrbot-campus-login",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-11-10",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "LOGINS", "class_name": "LoginTicket" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LoginTicket"] }]
+}
