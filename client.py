@@ -30,12 +30,22 @@ USER_AGENT = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Mobile Safari/5
 CHINA_TIME = timezone(timedelta(hours=8))
 
 
+class CampusLoginError(ValueError):
+    """Represent a login failure using a safe reason and user-facing message."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
 class LoginForm(HTMLParser):
     """Read CAS hidden inputs independently of HTML attribute order."""
 
     def __init__(self, html: str):
         super().__init__()
         self.values: dict[str, str] = {}
+        self.error_parts: list[str] = []
+        self.error_depth = 0
         self.feed(html)
 
     def handle_starttag(self, tag: str, attrs):
@@ -46,8 +56,34 @@ class LoginForm(HTMLParser):
             attrs: Parsed HTML attributes.
         """
         attributes = dict(attrs)
+        if tag not in {"input", "img", "br", "hr", "meta", "link"}:
+            if self.error_depth:
+                self.error_depth += 1
+            elif (
+                attributes.get("id") in {"errormsg", "errormsghide"}
+                or "error-msg-box" in (attributes.get("class") or "").split()
+            ):
+                self.error_depth = 1
         if tag == "input" and attributes.get("name"):
             self.values[attributes["name"]] = attributes.get("value") or ""
+
+    def handle_endtag(self, tag: str):
+        """Track the end of nested error containers.
+
+        Args:
+            tag: Closing HTML tag name.
+        """
+        if self.error_depth and tag not in {"input", "img", "br", "hr", "meta", "link"}:
+            self.error_depth -= 1
+
+    def handle_data(self, data: str):
+        """Collect error text for classification without exposing raw responses.
+
+        Args:
+            data: Text inside an HTML element.
+        """
+        if self.error_depth and data.strip():
+            self.error_parts.append(data.strip())
 
 
 async def login(
@@ -69,31 +105,78 @@ async def login(
         ValueError: Authentication failed or the response is unsupported.
         httpx.HTTPError: A network request failed.
     """
-    response = await session.post("https://pass.hust.edu.cn/cas/rsa")
-    response.raise_for_status()
-    public_key = serialization.load_der_public_key(
-        b64decode(response.json()["publicKey"])
-    )
-    if not isinstance(public_key, RSAPublicKey):
-        raise ValueError("Unsupported CAS public key")
     response = await session.post(
-        LOGIN_URL,
-        data={
+        "https://pass.hust.edu.cn/cas/rsa",
+        headers={"Referer": LOGIN_URL, "X-Requested-With": "XMLHttpRequest"},
+    )
+    response.raise_for_status()
+    try:
+        key_material = response.json()["publicKey"]
+        public_key = (
+            serialization.load_pem_public_key(key_material.encode())
+            if "BEGIN" in key_material
+            else serialization.load_der_public_key(b64decode(key_material))
+        )
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise CampusLoginError(
+            "rsa_response", "校园认证返回的 RSA 公钥格式异常"
+        ) from exc
+    if not isinstance(public_key, RSAPublicKey):
+        raise CampusLoginError("rsa_type", "校园认证返回了不支持的公钥类型")
+    post_data = dict(form)
+    for key in ("un", "pd", "username", "password", "rsa"):
+        post_data.pop(key, None)
+    user_agent = session.headers.get("User-Agent", USER_AGENT)
+    post_data.update(
+        {
             "ul": b64encode(public_key.encrypt(username.encode(), PKCS1v15())).decode(),
             "pl": b64encode(public_key.encrypt(password.encode(), PKCS1v15())).decode(),
             "code": captcha,
-            "lt": form["lt"],
-            "execution": form["execution"],
-            "_eventId": "submit",
-        },
+            "_eventId": post_data.get("_eventId") or "submit",
+            "ua": json.dumps(
+                {
+                    "ua": user_agent,
+                    "browser": {"name": "Chrome", "major": "120"},
+                    "device": {"type": "mobile"},
+                    "os": {"name": "Android", "version": "16"},
+                },
+                separators=(",", ":"),
+            ),
+            "visitorId": hashlib.sha256(user_agent.encode()).hexdigest()[:32],
+        }
+    )
+    response = await session.post(
+        LOGIN_URL,
+        data=post_data,
+        headers={"Origin": "https://pass.hust.edu.cn", "Referer": LOGIN_URL},
     )
     response.raise_for_status()
     match = re.search(
-        r"window\.app\.getUserName\(\s*'[^']*'\s*,\s*'([^']*)'\s*\)", response.text
+        r"""getUserName\s*\(\s*["'][^"']*["']\s*,\s*["']([^"']+)["']""",
+        response.text,
     )
-    if match is None or len(parts := match.group(1).split(".")) != 4:
-        raise ValueError("CAS login did not return credentials")
-    return ".".join(parts[:3]), parts[3]
+    if match is not None:
+        parts = match.group(1).split(".")
+        # The first three segments form the JWT, followed by secret and optional expiry.
+        if len(parts) >= 4 and all(parts[:4]):
+            return ".".join(parts[:3]), parts[3]
+        raise CampusLoginError("token_bundle", "校园认证回调中的登录凭据格式异常")
+    error_text = " ".join(LoginForm(response.text).error_parts)
+    if "动态验证码" in error_text or "企业微信" in error_text:
+        raise CampusLoginError(
+            "second_factor", "校园认证要求动态验证码，当前登录流程尚未完成二次验证"
+        )
+    if "验证码" in error_text:
+        raise CampusLoginError(
+            "captcha", "校园认证未通过图片验证码校验，请获取新验证码重试"
+        )
+    if "密码" in error_text or "用户名" in error_text:
+        raise CampusLoginError("credentials", "校园认证提示账号或密码校验失败")
+    if any(word in error_text for word in ("锁定", "冻结", "禁用")):
+        raise CampusLoginError("account_restricted", "校园认证提示账号已被限制登录")
+    raise CampusLoginError(
+        "missing_callback", "校园认证未返回登录凭据，需要检查登录回调或额外验证步骤"
+    )
 
 
 class CrighClient:

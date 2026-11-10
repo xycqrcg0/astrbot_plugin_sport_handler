@@ -5,6 +5,7 @@ import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
@@ -19,6 +20,7 @@ from .client import (
     CHINA_TIME,
     LOGIN_URL,
     USER_AGENT,
+    CampusLoginError,
     CrighClient,
     LoginForm,
     encode_activity,
@@ -157,9 +159,56 @@ class Main(Star):
             return "登录已失效，请私聊发送 /cam login。"
         except InvalidToken:
             return "保存的登录状态无法解密，请发送 /cam login 重新绑定。"
-        except httpx.HTTPError:
-            self.logger.warning("Campus request failed")
-            return "校园服务请求失败。若正在提交，结果可能已部分保存，请先核查客户端记录，再查询 /cam status。"
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            request = exc.request
+            status = (
+                exc.response.status_code
+                if isinstance(exc, httpx.HTTPStatusError)
+                else None
+            )
+            is_worker = request.url.host == urlsplit(self.web_login.url).hostname
+            service = "Worker" if is_worker else "校园服务"
+            # Omit queries, headers and bodies because they may contain credentials.
+            self.logger.warning(
+                "Campus operation failed: action=%s error=%s method=%s host=%s path=%s status=%s",
+                action,
+                type(exc).__name__,
+                request.method,
+                request.url.host,
+                request.url.path,
+                status,
+            )
+            detail = f"HTTP {status}" if status is not None else type(exc).__name__
+            message = f"{service}请求失败（{detail}）。"
+            if is_worker:
+                if status in {401, 403}:
+                    return (
+                        message
+                        + "请检查 worker_secret 与 Worker 的 BOT_SECRET 是否一致，以及 Worker 的访问策略。"
+                    )
+                if status == 404:
+                    return (
+                        message
+                        + "请检查 worker_url 是否为登录 Worker 的 HTTPS 根地址，以及后端接口是否已部署。"
+                    )
+                if status in {500, 502, 503}:
+                    return (
+                        message
+                        + "请检查 Worker 日志、BOT_SECRET 和 LOGINS 存储绑定配置。"
+                    )
+                return (
+                    message
+                    + "请检查运行 AstrBot 的环境能否连接 Worker，并查看日志中的失败接口。"
+                )
+            if action == "run":
+                return (
+                    message
+                    + "提交结果可能已部分保存，请先核查客户端记录，再查询 /cam status。"
+                )
+            return (
+                message
+                + "请检查运行 AstrBot 的环境能否连接校园登录服务，并查看日志中的失败接口。"
+            )
         except (ValueError, KeyError, TypeError, OSError):
             self.logger.warning("Campus response, template or stored state is invalid")
             return "校园服务响应、模板或存储数据异常。请检查模板，或发送 /cam login 重新登录；提交过程中出错请先核查客户端记录。"
@@ -239,8 +288,15 @@ class Main(Star):
                 return "登录成功，已保存当前用户的账号绑定和登录状态。发送 /cam run 执行一次，/cam status 查看状态。"
             except TimeoutError:
                 return "登录等待超时，请发送 /cam login 重新开始。"
-            except ValueError:
-                return "登录失败，请检查账号、密码和验证码后发送 /cam login 重试。"
+            except CampusLoginError as exc:
+                self.logger.warning("Campus login failed: reason=%s", exc.reason)
+                return f"登录未完成：{exc}。请发送 /cam login 重新开始。"
+            except ValueError as exc:
+                self.logger.warning(
+                    "Campus login response processing failed: error=%s",
+                    type(exc).__name__,
+                )
+                return "校园登录响应解析失败，请查看日志中的错误类型后重试。"
             finally:
                 credentials.clear()
 

@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from astrbot.api.event import AstrMessageEvent, MessageChain
 
-from .client import LOGIN_URL, USER_AGENT, LoginForm
+from .client import LOGIN_URL, USER_AGENT, CampusLoginError, LoginForm
 
 if TYPE_CHECKING:
     from .main import Main
@@ -208,7 +208,13 @@ class WorkerLogin:
                                 "success": True,
                                 "message": "登录成功，已绑定账号。返回机器人发送 /cam run 即可执行。",
                             }
-                        except Exception:
+                        except Exception as exc:
+                            self.plugin.logger.warning(
+                                "Campus browser login failed: reason=%s",
+                                exc.reason
+                                if isinstance(exc, CampusLoginError)
+                                else type(exc).__name__,
+                            )
                             completion = {
                                 "success": False,
                                 "message": "登录未完成，请返回机器人重新发送 /cam web，检查账号、密码和验证码。",

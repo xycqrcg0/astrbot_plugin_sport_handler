@@ -144,6 +144,8 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.records = {}
         self.notifications = []
         self.cas_posts = 0
+        self.login_html = None
+        self.cas_forms = []
         self.uploads = []
         self.completions = 0
         self.lose_completion = False
@@ -236,13 +238,16 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         if path == "/cas/login":
             self.cas_posts += 1
             fields = parse_qs(request.content.decode())
+            self.cas_forms.append(fields)
             password = self.key.decrypt(
                 base64.b64decode(fields["pl"][0]), padding.PKCS1v15()
             )
             self.assertEqual(password, b" password ")
             self.assertIn("cas=session", request.headers["cookie"])
             return httpx.Response(
-                200, text=f"window.app.getUserName('x','a.b.c.{self.secret}')"
+                200,
+                text=self.login_html
+                or f"window.app.getUserName('x','a.b.c.{self.secret}.2026-11-17')",
             )
         if path.endswith("/u/info"):
             return httpx.Response(200, json={"data": {"xm": "Name", "xh": "123"}})
@@ -269,6 +274,63 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(b"application/octet-stream", request.content)
             return httpx.Response(200, json={"code": 200})
         raise AssertionError(str(request.url))
+
+    async def test_login_accepts_expiry_and_callback_quote_variants(self):
+        client = importlib.import_module("campus_login_test.client")
+        for callback in [
+            f"window.app.getUserName('x','a.b.c.{self.secret}')",
+            f"window.app.getUserName('x','a.b.c.{self.secret}.2026-11-17')",
+            f'getUserName ("x", "a.b.c.{self.secret}.2026-11-17");',
+        ]:
+            with self.subTest(callback=callback.split("(", 1)[0]):
+                self.login_html = callback
+                async with httpx.AsyncClient() as session:
+                    await session.get(client.LOGIN_URL)
+                    token, secret = await client.login(
+                        session,
+                        {
+                            "lt": "LT",
+                            "execution": "E",
+                            "extra": "kept",
+                            "un": "plain-user",
+                            "pd": "plain-password",
+                        },
+                        "student",
+                        " password ",
+                        "1234",
+                    )
+                self.assertEqual(token, "a.b.c")
+                self.assertEqual(secret, self.secret)
+                self.assertEqual(self.cas_forms[-1]["extra"], ["kept"])
+                self.assertIn("ua", self.cas_forms[-1])
+                self.assertIn("visitorId", self.cas_forms[-1])
+                self.assertNotIn("un", self.cas_forms[-1])
+                self.assertNotIn("pd", self.cas_forms[-1])
+
+    async def test_login_classifies_cas_errors_without_echoing_response(self):
+        client = importlib.import_module("campus_login_test.client")
+        for text, reason in [
+            ("验证码错误", "captcha"),
+            ("用户名或密码错误", "credentials"),
+            ("动态验证码已发送到企业微信", "second_factor"),
+            ("账号锁定", "account_restricted"),
+            ("unrecognized server response", "missing_callback"),
+        ]:
+            with self.subTest(reason=reason):
+                self.login_html = f'<div id="errormsg"><span>{text}</span> private-user private-password</div>'
+                async with httpx.AsyncClient() as session:
+                    await session.get(client.LOGIN_URL)
+                    with self.assertRaises(client.CampusLoginError) as caught:
+                        await client.login(
+                            session,
+                            {"lt": "LT", "execution": "E"},
+                            "student",
+                            " password ",
+                            "1234",
+                        )
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertNotIn("private-user", str(caught.exception))
+                self.assertNotIn("private-password", str(caught.exception))
 
     async def test_run_generates_data_without_external_template(self):
         user_key = (
@@ -383,6 +445,41 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.records[ticket]["status"], "error")
         self.assertEqual(self.cas_posts, 0)
         self.assertFalse(self.app.store)
+
+    async def test_worker_auth_error_identifies_service_without_logging_secrets(self):
+        request = httpx.Request(
+            "POST",
+            "https://relay.example/api/bot/create?ticket=private-ticket",
+            headers={"Authorization": "Bearer private-key"},
+        )
+        error = httpx.HTTPStatusError(
+            "private-key",
+            request=request,
+            response=httpx.Response(403, request=request),
+        )
+        with patch.object(self.app.web_login, "_request", side_effect=error):
+            with self.assertLogs(self.app.logger, level="WARNING") as logs:
+                result = await self.app._handle(Event(), "web")
+        self.assertIn("Worker请求失败（HTTP 403）", result)
+        self.assertIn("BOT_SECRET", result)
+        self.assertNotIn("部分保存", result)
+        self.assertIn("path=/api/bot/create", logs.output[0])
+        self.assertNotIn("private-ticket", logs.output[0])
+        self.assertNotIn("private-key", logs.output[0])
+        self.assertFalse(self.app.web_login.pending)
+
+    async def test_worker_configuration_error_reports_bindings(self):
+        request = httpx.Request("POST", "https://relay.example/api/bot/create")
+        error = httpx.HTTPStatusError(
+            "unavailable",
+            request=request,
+            response=httpx.Response(503, request=request),
+        )
+        with patch.object(self.app.web_login, "_request", side_effect=error):
+            with self.assertLogs(self.app.logger, level="WARNING"):
+                result = await self.app._handle(Event(), "web")
+        self.assertIn("HTTP 503", result)
+        self.assertIn("LOGINS", result)
 
     async def test_chat_login_still_isolates_concurrent_users(self):
         async def chat(user):
