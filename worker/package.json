@@ -1,6 +1,7 @@
 {
   "name": "astrbot-campus-login",
   "private": true,
+  "packageManager": "pnpm@11.25.0",
   "type": "module",
   "engines": { "node": ">=22" },
   "scripts": {
