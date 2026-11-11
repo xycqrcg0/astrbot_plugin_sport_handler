@@ -4,16 +4,6 @@
 
 默认按内置操场路线生成约 2.15 公里的记录，使用男生路线配置。提交后的审核结果和有效成绩以校园跑客户端为准。
 
-## 安装
-
-将插件目录放到 AstrBot 的 `data/plugins/astrbot_plugin_sport_handler` 下。在运行 AstrBot 的 Python 环境中，从 AstrBot 项目根目录安装依赖。
-
-```bash
-python -m pip install -r data/plugins/astrbot_plugin_sport_handler/requirements.txt
-```
-
-在 WebUI 插件管理中加载或重载校园跑插件。
-
 ## 使用
 
 所有命令在机器人私聊中使用。
@@ -31,27 +21,8 @@ python -m pip install -r data/plugins/astrbot_plugin_sport_handler/requirements.
 启用 `campus_run` LLM 工具后，也可以对机器人说“查看校园跑状态”或“执行一次校园跑”。
 
 ## 网页登录部署
-
-准备 Node.js 22+、pnpm 和 Cloudflare 账号。从 AstrBot 项目根目录进入 Worker 目录并部署。
-
-```bash
-cd data/plugins/astrbot_plugin_sport_handler/worker
-pnpm install
-pnpm exec wrangler login
-pnpm deploy
-```
-
-保存部署后显示的 HTTPS 站点地址。随后生成通信密钥。
-
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-```
-
-保存生成的字符串，执行下列命令，在提示中粘贴该密钥。
-
-```bash
-pnpm exec wrangler secret put BOT_SECRET
-```
+> 这个也可以不用管，只用二维码登录即可。
+使用 cloudflare workers 部署，从 github 构建，选择本项目地址，在构建时根目录改为 /worker，进行部署即可。之后在该 worker 设置处配置密钥 `BOT_SECRET` 。
 
 在 AstrBot 的校园跑插件配置中填写以下字段，保存并重载插件。
 
