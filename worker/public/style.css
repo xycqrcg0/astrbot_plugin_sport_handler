@@ -1,5 +1,6 @@
 :root { font-family: Inter, system-ui, sans-serif; color: #202a27; background: #f1f4f1; color-scheme: light; }
 * { box-sizing: border-box; }
+fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
 body { margin: 0; padding: 48px 20px; }
 main { max-width: 440px; margin: 0 auto; background: #fff; border: 1px solid #dce3dd; border-radius: 16px; padding: 32px; }
 h1 { font-size: 28px; font-weight: 650; letter-spacing: -.03em; margin: 0 0 12px; }

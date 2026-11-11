@@ -14,6 +14,7 @@
     <p>登录后，将账号绑定到发起链接的机器人用户。</p>
     <p id="status" role="status" aria-live="polite">正在读取登录链接…</p>
     <form id="login" hidden>
+      <fieldset id="first-step">
       <label for="username">校园账号</label>
       <input id="username" name="username" autocomplete="username" required maxlength="128">
       <label for="password">密码</label>
@@ -21,6 +22,11 @@
       <label for="captcha">图片验证码</label>
       <img id="captcha-image" alt="校园登录验证码">
       <input id="captcha" name="captcha" autocomplete="off" required maxlength="16">
+      </fieldset>
+      <fieldset id="second-step" hidden disabled>
+        <label for="otp">学校发送的动态验证码</label>
+        <input id="otp" name="otp" autocomplete="one-time-code" required maxlength="64">
+      </fieldset>
       <button type="submit">登录并绑定</button>
       <p class="hint">请确认链接来自你本人发起的私聊。页面会将加密后的输入交给机器人完成学校登录。</p>
     </form>

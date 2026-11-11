@@ -4,6 +4,7 @@ const form = document.querySelector("#login");
 let publicKey;
 let expires = 0;
 let polling = false;
+let secondStep = false;
 
 function encode(bytes) {
   return btoa(String.fromCharCode(...new Uint8Array(bytes)));
@@ -31,13 +32,18 @@ async function refresh() {
   try {
     const result = await api("status");
     expires = result.expires;
-    if (result.status === "ready") {
+    if (["ready", "challenge"].includes(result.status)) {
+      secondStep = result.status === "challenge";
+      const first = document.querySelector("#first-step");
+      const second = document.querySelector("#second-step");
+      first.hidden = first.disabled = secondStep;
+      second.hidden = second.disabled = !secondStep;
       publicKey = result.public_key;
-      document.querySelector("#captcha-image").src = `data:image/gif;base64,${result.captcha}`;
-      status.textContent = "请输入账号、密码和验证码，链接有效期为 3 分钟。";
+      if (!secondStep) document.querySelector("#captcha-image").src = `data:image/gif;base64,${result.captcha}`;
+      status.textContent = secondStep ? "学校要求二次验证，请查收邮箱或学校指定渠道的动态验证码，3 分钟内填写。" : "请输入账号、密码和验证码，链接有效期为 3 分钟。";
       form.hidden = false;
       polling = false;
-    } else if (result.status === "submitted") {
+    } else if (["submitted", "verified_input"].includes(result.status)) {
       form.hidden = true;
       status.textContent = "已提交，正在等待机器人完成登录…";
       polling = true;
@@ -63,7 +69,7 @@ form.addEventListener("submit", async (event) => {
   try {
     if (Date.now() >= expires) throw new Error("链接已过期，请返回机器人重新获取。");
     const encoder = new TextEncoder();
-    const credentials = encoder.encode(JSON.stringify({
+    const credentials = encoder.encode(JSON.stringify(secondStep ? { otp: form.elements.otp.value.trim() } : {
       username: form.elements.username.value.trim(),
       password: form.elements.password.value,
       captcha: form.elements.captcha.value.trim(),
@@ -76,7 +82,7 @@ form.addEventListener("submit", async (event) => {
       { name: "AES-GCM", iv: nonce, additionalData: encoder.encode(ticket) }, aes, credentials);
     const wrappedKey = await crypto.subtle.encrypt(
       { name: "RSA-OAEP" }, rsa, await crypto.subtle.exportKey("raw", aes));
-    await api("submit", { envelope: { key: encode(wrappedKey), nonce: encode(nonce), data: encode(data) } });
+    await api(secondStep ? "verify" : "submit", { envelope: { key: encode(wrappedKey), nonce: encode(nonce), data: encode(data) } });
     form.reset();
     form.hidden = true;
     polling = true;

@@ -17,7 +17,7 @@ export default {
         response = json({ message: "Method not allowed" }, 405);
       } else {
         const bot = url.pathname.startsWith("/api/bot/");
-        const actions = bot ? ["create", "poll", "complete", "revoke"] : ["status", "submit"];
+        const actions = bot ? ["create", "poll", "challenge", "complete", "revoke"] : ["status", "submit", "verify"];
         const prefix = bot ? "/api/bot/" : "/api/user/";
         const action = url.pathname.slice(prefix.length);
         if (!url.pathname.startsWith(prefix) || !actions.includes(action)) {
@@ -131,32 +131,42 @@ export class LoginTicket {
       if (action === "poll" && bot) {
         return json({ status: record.status, envelope: record.envelope });
       }
+      if (action === "challenge" && bot) {
+        if (record.status === "submitted") {
+          record.status = "challenge";
+          delete record.envelope;
+          record.expires = Date.now() + 180000;
+          await transaction.put("login", record);
+          await this.ctx.storage.setAlarm(record.expires);
+        }
+        return ["challenge", "verified_input"].includes(record.status)
+          ? json({ status: record.status }) : json({ message: "Invalid challenge state" }, 409);
+      }
       if (action === "status" && !bot) {
         return json({
           status: record.status, expires: record.expires, message: record.message,
-          public_key: record.status === "ready" ? record.public_key : undefined,
+          public_key: ["ready", "challenge"].includes(record.status) ? record.public_key : undefined,
           captcha: record.status === "ready" ? record.captcha : undefined,
         });
       }
-      if (action === "submit" && !bot) {
-        if (record.status !== "ready") return json({ message: "此链接已提交，请等待结果或重新获取链接。" }, 409);
+      if (["submit", "verify"].includes(action) && !bot) {
+        if (record.status !== (action === "verify" ? "challenge" : "ready")) return json({ message: "此链接已提交，请等待结果或重新获取链接。" }, 409);
         const envelope = payload.envelope;
         if (!envelope || typeof envelope.key !== "string" || envelope.key.length !== 344 ||
             typeof envelope.nonce !== "string" || envelope.nonce.length !== 16 ||
             typeof envelope.data !== "string" || envelope.data.length > 6000 || !envelope.data) {
           return json({ message: "Invalid encrypted submission" }, 400);
         }
-        record.status = "submitted";
+        record.status = action === "verify" ? "verified_input" : "submitted";
         record.envelope = { key: envelope.key, nonce: envelope.nonce, data: envelope.data };
         delete record.captcha;
-        delete record.public_key;
         await transaction.put("login", record);
-        return json({ status: "submitted" });
+        return json({ status: record.status });
       }
       if (action === "complete" && bot) {
         // Completion retries are idempotent after a lost network response.
         if (["success", "error"].includes(record.status)) return json({ status: record.status });
-        if (record.status !== "submitted" || typeof payload.success !== "boolean") {
+        if (!["submitted", "challenge", "verified_input"].includes(record.status) || typeof payload.success !== "boolean") {
           return json({ message: "No pending submission" }, 409);
         }
         record = {

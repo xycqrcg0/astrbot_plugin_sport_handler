@@ -1,19 +1,23 @@
 """Campus running protocol adapted from the supplied script."""
 
+import asyncio
 import copy
 import gzip
 import hashlib
+import io
 import json
 import random
 import re
 import struct
 import time
 import urllib.parse
+import uuid
 from base64 import b64decode, b64encode
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 
 import httpx
+import qrcode
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
@@ -46,6 +50,8 @@ class LoginForm(HTMLParser):
         self.values: dict[str, str] = {}
         self.error_parts: list[str] = []
         self.error_depth = 0
+        self.dynamic_input = False
+        self.action = None
         self.feed(html)
 
     def handle_starttag(self, tag: str, attrs):
@@ -56,6 +62,14 @@ class LoginForm(HTMLParser):
             attrs: Parsed HTML attributes.
         """
         attributes = dict(attrs)
+        if tag == "form" and attributes.get("id") == "loginForm":
+            self.action = attributes.get("action")
+        if (
+            tag == "input"
+            and attributes.get("id") == "phoneCode"
+            and attributes.get("type") != "hidden"
+        ):
+            self.dynamic_input = True
         if tag not in {"input", "img", "br", "hr", "meta", "link"}:
             if self.error_depth:
                 self.error_depth += 1
@@ -87,7 +101,15 @@ class LoginForm(HTMLParser):
 
 
 async def login(
-    session: httpx.AsyncClient, form: dict, username: str, password: str, captcha: str
+    session: httpx.AsyncClient,
+    form: dict,
+    username: str,
+    password: str,
+    captcha: str,
+    ask_code=None,
+    *,
+    dynamic_code: str = "",
+    target: str = LOGIN_URL,
 ) -> tuple[str, str]:
     """Finish CAS login using the session that issued the captcha.
 
@@ -97,6 +119,9 @@ async def login(
         username: Campus account name.
         password: Account password, used only for this request.
         captcha: User-provided captcha text.
+        ask_code: Async callback that collects the school's dynamic code.
+        dynamic_code: One-time code for the second submission.
+        target: Validated CAS login form URL.
 
     Returns:
         Authorization token and protocol secret.
@@ -132,6 +157,7 @@ async def login(
             "ul": b64encode(public_key.encrypt(username.encode(), PKCS1v15())).decode(),
             "pl": b64encode(public_key.encrypt(password.encode(), PKCS1v15())).decode(),
             "code": captcha,
+            "phoneCode": dynamic_code,
             "_eventId": post_data.get("_eventId") or "submit",
             "ua": json.dumps(
                 {
@@ -146,22 +172,39 @@ async def login(
         }
     )
     response = await session.post(
-        LOGIN_URL,
+        target,
         data=post_data,
         headers={"Origin": "https://pass.hust.edu.cn", "Referer": LOGIN_URL},
     )
     response.raise_for_status()
-    match = re.search(
-        r"""getUserName\s*\(\s*["'][^"']*["']\s*,\s*["']([^"']+)["']""",
-        response.text,
-    )
-    if match is not None:
-        parts = match.group(1).split(".")
-        # The first three segments form the JWT, followed by secret and optional expiry.
-        if len(parts) >= 4 and all(parts[:4]):
-            return ".".join(parts[:3]), parts[3]
-        raise CampusLoginError("token_bundle", "校园认证回调中的登录凭据格式异常")
-    error_text = " ".join(LoginForm(response.text).error_parts)
+    bundle = parse_login_callback(response.text)
+    if bundle:
+        return bundle
+    challenge = LoginForm(response.text)
+    if challenge.dynamic_input:
+        if dynamic_code:
+            raise CampusLoginError("dynamic_code", "学校未接受动态验证码，请重新登录")
+        if ask_code and challenge.values.get("execution") and challenge.action:
+            destination = urllib.parse.urljoin(str(response.url), challenge.action)
+            url = httpx.URL(destination)
+            if url.copy_with(query=None, fragment=None) != httpx.URL(
+                "https://pass.hust.edu.cn/cas/login"
+            ):
+                raise CampusLoginError("challenge_action", "学校动态验证表单地址异常")
+            code = (await ask_code()).strip()
+            if not code or len(code) > 64:
+                raise CampusLoginError("dynamic_code", "动态验证码格式无效")
+            return await login(
+                session,
+                challenge.values,
+                username,
+                password,
+                "",
+                dynamic_code=code,
+                target=destination,
+            )
+        raise CampusLoginError("second_factor", "学校要求动态验证，未取得完整验证表单")
+    error_text = " ".join(challenge.error_parts)
     if "动态验证码" in error_text or "企业微信" in error_text:
         raise CampusLoginError(
             "second_factor", "校园认证要求动态验证码，当前登录流程尚未完成二次验证"
@@ -177,6 +220,89 @@ async def login(
     raise CampusLoginError(
         "missing_callback", "校园认证未返回登录凭据，需要检查登录回调或额外验证步骤"
     )
+
+
+def parse_login_callback(html: str) -> tuple[str, str] | None:
+    """Read the campus app's shared CAS callback.
+
+    Args:
+        html: Campus callback page.
+
+    Returns:
+        App token and signing secret when the callback is present.
+
+    Raises:
+        CampusLoginError: The callback contains malformed credentials.
+    """
+    match = re.search(
+        r"""getUserName\s*\(\s*["'][^"']*["']\s*,\s*["']([^"']+)["']""", html
+    )
+    if match is None:
+        return None
+    parts = match.group(1).split(".")
+    if len(parts) < 4 or not all(parts[:4]):
+        raise CampusLoginError("token_bundle", "校园认证回调中的登录凭据格式异常")
+    return ".".join(parts[:3]), parts[3]
+
+
+async def qr_login(session: httpx.AsyncClient, send_image) -> tuple[str, str]:
+    """Issue a campus QR code and redeem its confirmation in the issuing session.
+
+    Args:
+        session: Cookie-preserving campus HTTP client.
+        send_image: Async function delivering PNG bytes to the initiating user.
+
+    Returns:
+        Campus app token and signing secret.
+
+    Raises:
+        CampusLoginError: The QR code expired or CAS returned an unexpected redirect.
+        httpx.HTTPError: A campus request failed.
+    """
+    page = await session.get(LOGIN_URL)
+    page.raise_for_status()
+    ticket = str(uuid.uuid4())
+    params = {"uuid": ticket, "service": httpx.URL(LOGIN_URL).params["service"]}
+    scan_url = httpx.URL("https://pass.hust.edu.cn/cas/qyQrLogin", params=params)
+    image = io.BytesIO()
+    qrcode.make(str(scan_url)).save(image, format="PNG")
+    deadline = time.monotonic() + 180
+    await send_image(image.getvalue())
+    while time.monotonic() < deadline:
+        await asyncio.sleep(3)
+        response = await session.get(
+            "https://pass.hust.edu.cn/cas/checkQRCodeScan",
+            params={"uuid": ticket, "random": str(time.time_ns())},
+            headers={"Referer": LOGIN_URL, "X-Requested-With": "XMLHttpRequest"},
+        )
+        response.raise_for_status()
+        if not response.content.strip():
+            continue
+        result = response.json()
+        target = result.get("redirect_url") if isinstance(result, dict) else None
+        if not isinstance(target, str) or not target:
+            raise CampusLoginError("qr_response", "学校返回了无法识别的扫码结果")
+        url = page.url.join(target)
+        for _ in range(10):
+            if (
+                url.scheme != "https"
+                or url.host not in {"pass.hust.edu.cn", "petzjk.hust.edu.cn"}
+                or url.port
+                or url.userinfo
+            ):
+                break
+            response = await session.get(url, follow_redirects=False)
+            if response.is_redirect and response.headers.get("location"):
+                url = url.join(response.headers["location"])
+                continue
+            response.raise_for_status()
+            if url.host == "petzjk.hust.edu.cn":
+                bundle = parse_login_callback(response.text)
+                if bundle:
+                    return bundle
+            break
+        raise CampusLoginError("qr_callback", "扫码后未收到校园跑登录凭据")
+    raise CampusLoginError("qr_expired", "二维码已过期，请重新发送 /cam login")
 
 
 class CrighClient:

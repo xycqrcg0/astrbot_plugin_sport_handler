@@ -170,21 +170,56 @@ class WorkerLogin:
                     if result.get("status") == "submitted":
                         credentials = {}
                         try:
-                            envelope = result["envelope"]
-                            aes_key = pending.key.decrypt(
-                                base64.b64decode(envelope["key"], validate=True),
-                                padding.OAEP(
-                                    mgf=padding.MGF1(hashes.SHA256()),
-                                    algorithm=hashes.SHA256(),
-                                    label=None,
-                                ),
-                            )
-                            plaintext = AESGCM(aes_key).decrypt(
-                                base64.b64decode(envelope["nonce"], validate=True),
-                                base64.b64decode(envelope["data"], validate=True),
-                                ticket.encode(),
-                            )
-                            credentials = json.loads(plaintext)
+
+                            def decrypt(envelope):
+                                aes_key = pending.key.decrypt(
+                                    base64.b64decode(envelope["key"], validate=True),
+                                    padding.OAEP(
+                                        mgf=padding.MGF1(hashes.SHA256()),
+                                        algorithm=hashes.SHA256(),
+                                        label=None,
+                                    ),
+                                )
+                                return json.loads(
+                                    AESGCM(aes_key).decrypt(
+                                        base64.b64decode(
+                                            envelope["nonce"], validate=True
+                                        ),
+                                        base64.b64decode(
+                                            envelope["data"], validate=True
+                                        ),
+                                        ticket.encode(),
+                                    )
+                                )
+
+                            async def ask_code() -> str:
+                                requested = False
+                                while time.monotonic() < pending.deadline:
+                                    try:
+                                        if not requested:
+                                            await self._request("challenge", ticket)
+                                            requested = True
+                                            pending.deadline = time.monotonic() + 180
+                                        item = await self._request("poll", ticket)
+                                        if item.get("status") == "verified_input":
+                                            payload = decrypt(item["envelope"])
+                                            if (
+                                                not isinstance(payload, dict)
+                                                or set(payload) != {"otp"}
+                                                or not isinstance(payload["otp"], str)
+                                            ):
+                                                raise ValueError(
+                                                    "Invalid code envelope"
+                                                )
+                                            return payload["otp"]
+                                        if item.get("status") != "challenge":
+                                            raise ValueError("Invalid challenge state")
+                                    except httpx.RequestError:
+                                        pass
+                                    await asyncio.sleep(3)
+                                raise TimeoutError("Campus code expired")
+
+                            credentials = decrypt(result["envelope"])
                             if (
                                 not isinstance(credentials, dict)
                                 or set(credentials)
@@ -203,6 +238,7 @@ class WorkerLogin:
                                     credentials["username"].strip(),
                                     credentials["password"],
                                     credentials["captcha"].strip(),
+                                    ask_code=ask_code,
                                 )
                             completion = {
                                 "success": True,

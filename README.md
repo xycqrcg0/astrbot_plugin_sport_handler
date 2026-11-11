@@ -18,7 +18,8 @@ python -m pip install -r data/plugins/astrbot_plugin_sport_handler/requirements.
 
 所有命令在机器人私聊中使用。
 
-- `/cam login`，依次输入校园账号、密码和图片验证码。每步限时 180 秒，回复 `取消` 结束。
+- `/cam login`，机器人在私聊中发送学校登录二维码。使用华中科技大学企业微信扫码并确认，二维码 3 分钟内有效，仅供本人使用。过期后重新发送命令即可。扫码登录无需配置 Worker。
+- `/cam password`，依次输入校园账号、密码和图片验证码。如果学校要求二次验证，再回复学校发送的动态验证码。每步限时 180 秒，回复 `取消` 结束。
 - `/cam web`，打开机器人发送的专属链接，在网页中完成登录。需要先部署并配置下方的 Worker。
 - `/cam run`，使用已绑定账号执行一次校园跑。直接发送 `/cam` 也会执行。
 - `/cam status`，查询登录状态和最近提交阶段。
@@ -57,7 +58,7 @@ pnpm exec wrangler secret put BOT_SECRET
 - `worker_url`，Worker 的 HTTPS 根地址，例如 `https://astrbot-campus-login.example.workers.dev`。
 - `worker_secret`，与 `BOT_SECRET` 完全一致的通信密钥。
 
-私聊发送 `/cam web` 即可获取登录链接。链接有效期为 3 分钟，仅可提交一次，请仅本人使用。登录失败、验证码过期或插件重载后重新获取链接。
+私聊发送 `/cam web` 获取个人登录链接，3 分钟内提交。若学校要求二次验证，在同一页面输入动态验证码，每步仅可提交一次。登录失败、验证码过期或插件重载后重新获取链接。
 
 ## 使用已有模板
 

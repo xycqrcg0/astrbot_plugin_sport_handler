@@ -484,7 +484,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_login_still_isolates_concurrent_users(self):
         async def chat(user):
             event = Event(user)
-            task = asyncio.create_task(self.app._handle(event, "login"))
+            task = asyncio.create_task(self.app._handle(event, "password"))
             for _ in range(100):
                 if event.unified_msg_origin in self.waiter.USER_SESSIONS:
                     break

@@ -26,6 +26,7 @@ from .client import (
     encode_activity,
     login,
     make_data,
+    qr_login,
 )
 from .generation import generate_data
 from .worker_login import WorkerLogin
@@ -91,19 +92,50 @@ class Main(Star):
         """
         if not event.is_private_chat():
             return "请在私聊中使用校园跑。发送 /cam login 开始绑定账号。"
-        if action not in {"login", "web", "status", "logout", "run", "reset"}:
-            return "用法：/cam [login|web|status|logout|run|reset]；省略操作时执行一次校园跑。"
+        if action not in {
+            "login",
+            "password",
+            "web",
+            "status",
+            "logout",
+            "run",
+            "reset",
+        }:
+            return "用法：/cam [login|password|web|status|logout|run|reset]；省略操作时执行一次校园跑。"
         identity = json.dumps([event.get_platform_id(), event.get_sender_id()])
         user_key = "user:" + hashlib.sha256(identity.encode()).hexdigest()
         lock = self.user_locks.setdefault(user_key, asyncio.Lock())
         if lock.locked():
-            return "你的校园跑操作正在进行，请等待完成。登录过程中可回复 取消。"
+            return "你的校园跑操作正在进行，请等待完成。"
         task = asyncio.current_task()
         self.tasks.add(task)
         try:
             async with lock:
-                if action == "login":
+                if action in {"login", "password"}:
                     await self.web_login.revoke(user_key)
+                    if action == "login":
+
+                        async def send_image(png: bytes):
+                            await event.send(
+                                event.plain_result(
+                                    "请使用华中科技大学企业微信扫描下方二维码，3 分钟内完成登录。二维码仅供本人使用。"
+                                )
+                            )
+                            await event.send(event.chain_result([Image.fromBytes(png)]))
+
+                        async with httpx.AsyncClient(
+                            timeout=30,
+                            follow_redirects=True,
+                            headers={"User-Agent": USER_AGENT},
+                        ) as session:
+                            try:
+                                token, secret = await qr_login(session, send_image)
+                            except CampusLoginError as exc:
+                                return str(exc)
+                            await self._save_login(session, user_key, token, secret)
+                        return (
+                            "扫码登录成功，已绑定当前用户。发送 /cam status 查看状态。"
+                        )
                     return await self._login(event, user_key)
                 if action == "web":
                     return await self.web_login.issue(event, user_key)
@@ -284,13 +316,41 @@ class Main(Star):
                 await collect(event)
                 if cancelled:
                     return "已取消登录。"
-                await self._complete_login(session, form, user_key, *credentials)
+
+                async def ask_code() -> str:
+                    code = ""
+
+                    @session_waiter(timeout=180, record_history_chains=False)
+                    async def receive(
+                        controller: SessionController, reply: AstrMessageEvent
+                    ):
+                        nonlocal code
+                        if (
+                            reply.is_private_chat()
+                            and reply.get_sender_id() == event.get_sender_id()
+                        ):
+                            code = reply.message_str.strip()
+                            controller.stop()
+
+                    await event.send(
+                        event.plain_result(
+                            "学校要求二次验证，请查收学校发送的动态验证码（可能在邮箱或企业微信），在 180 秒内回复，或回复 取消。"
+                        )
+                    )
+                    await receive(event)
+                    if code in {"取消", "/取消"}:
+                        raise CampusLoginError("cancelled", "已取消登录")
+                    return code
+
+                await self._complete_login(
+                    session, form, user_key, *credentials, ask_code=ask_code
+                )
                 return "登录成功，已保存当前用户的账号绑定和登录状态。发送 /cam run 执行一次，/cam status 查看状态。"
             except TimeoutError:
-                return "登录等待超时，请发送 /cam login 重新开始。"
+                return "登录等待超时，请发送 /cam password 重新开始。"
             except CampusLoginError as exc:
                 self.logger.warning("Campus login failed: reason=%s", exc.reason)
-                return f"登录未完成：{exc}。请发送 /cam login 重新开始。"
+                return f"登录未完成：{exc}。请发送 /cam password 重新开始。"
             except ValueError as exc:
                 self.logger.warning(
                     "Campus login response processing failed: error=%s",
@@ -308,6 +368,7 @@ class Main(Star):
         username: str,
         password: str,
         captcha: str,
+        ask_code=None,
     ) -> None:
         """Verify a campus login and persist the same binding for both login modes.
 
@@ -318,18 +379,33 @@ class Main(Star):
             username: Campus account name.
             password: Password used only for authentication.
             captcha: User-entered captcha text.
+            ask_code: Collect the second-factor code from the originating user.
 
         Raises:
             ValueError: Authentication or account verification failed.
             httpx.HTTPError: A campus request failed.
         """
-        token, secret = await login(session, form, username, password, captcha)
+        token, secret = await login(
+            session, form, username, password, captcha, ask_code
+        )
+        await self._save_login(session, user_key, token, secret, username)
+
+    async def _save_login(self, session, user_key, token, secret, username=None):
+        """Verify the campus identity before replacing this user's binding.
+
+        Args:
+            session: Authenticated campus HTTP client.
+            user_key: Initiating platform user.
+            token: Campus authorization token.
+            secret: Campus protocol signing secret.
+            username: Optional username from password login.
+        """
         client = CrighClient(session, token, secret)
         info = (await client.request("GET", "/api/l/v6/u/info")).get("data")
         if not isinstance(info, dict) or not info.get("xh") or not info.get("xm"):
             raise ValueError("Campus account information is missing")
         account = {
-            "username": username,
+            "username": username or str(info["xh"]),
             "student_id": str(info["xh"]),
             "token": token,
             "secret": secret,
