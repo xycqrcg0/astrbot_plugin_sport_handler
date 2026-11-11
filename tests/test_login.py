@@ -27,13 +27,18 @@ ROOT = PLUGIN.parents[2]
 
 
 class Event:
-    def __init__(self, user="user", text=""):
+    def __init__(self, user="user", text="", group=None):
         self.user = user
         self.message_str = text
         self.unified_msg_origin = "platform:FriendMessage:" + user
+        if group:
+            self.unified_msg_origin = "platform:GroupMessage:" + group
 
     def is_private_chat(self):
-        return True
+        return ":FriendMessage:" in self.unified_msg_origin
+
+    def get_platform_name(self):
+        return "aiocqhttp"
 
     def get_sender_id(self):
         return self.user
@@ -172,6 +177,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
 
     async def notify(self, origin, message):
         self.notifications.append((origin, message))
+        return True
 
     async def respond(self, request):
         path = request.url.path
@@ -504,6 +510,39 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.app.store), 2)
         self.assertFalse(self.waiter.USER_SESSIONS)
         self.assertFalse(self.waiter.FILTERS)
+
+    async def test_group_users_share_only_their_own_private_binding(self):
+        alice = Event("alice", group="shared")
+        bob = Event("bob", group="shared")
+        first, second = await asyncio.gather(
+            self.app._handle(alice, "web"), self.app._handle(bob, "web")
+        )
+        self.assertEqual(first, second)
+        self.assertNotIn("#", first)
+        self.assertIn("已私发", first)
+        self.assertEqual(
+            {origin for origin, _ in self.notifications},
+            {"platform:FriendMessage:alice", "platform:FriendMessage:bob"},
+        )
+        await asyncio.gather(
+            *(p.task for p in list(self.app.web_login.pending.values()))
+        )
+        self.assertIn("登录有效", await self.app.campus_run(alice, "status"))
+        await self.app._handle(alice, "logout")
+        self.assertIn("尚未登录", await self.app._handle(Event("alice"), "status"))
+        self.assertIn("登录有效", await self.app._handle(Event("bob"), "status"))
+        self.assertIn("私聊", await self.app._handle(bob, "password"))
+        self.assertFalse(self.waiter.USER_SESSIONS)
+
+    async def test_group_failed_private_delivery_revokes_link(self):
+        with patch.object(self.app.context, "send_message", return_value=False):
+            result = await self.app._handle(Event(group="shared"), "web")
+        self.assertIn("私发失败", result)
+        self.assertNotIn("#", result)
+        self.assertFalse(self.app.web_login.pending)
+        self.assertEqual(
+            [item["status"] for item in self.records.values()], ["cancelled"]
+        )
 
 
 if __name__ == "__main__":

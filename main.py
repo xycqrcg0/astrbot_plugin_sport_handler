@@ -60,7 +60,19 @@ class Main(Star):
             action: Execute, chat login, web login, status, logout or reset.
         """
         event.stop_event()
-        yield event.plain_result(await self._handle(event, action))
+        result = await self._handle(event, action)
+        if (
+            not event.is_private_chat()
+            and event.get_sender_id()
+            and event.get_platform_name() == "aiocqhttp"
+        ):
+            yield (
+                event.make_result()
+                .at(event.get_sender_name(), event.get_sender_id())
+                .message(" " + result)
+            )
+        else:
+            yield event.plain_result(result)
 
     @filter.llm_tool(name="campus_run")
     async def campus_run(self, event: AstrMessageEvent, action: str = "status") -> str:
@@ -90,8 +102,18 @@ class Main(Star):
         Returns:
             Sanitized result suitable for the user or LLM.
         """
-        if not event.is_private_chat():
-            return "请在私聊中使用校园跑。发送 /cam login 开始绑定账号。"
+        private = event.is_private_chat()
+        sender = event.get_sender_id()
+        if (
+            not sender
+            or not event.get_platform_id()
+            or (
+                not private
+                and event.get_platform_name() == "aiocqhttp"
+                and sender == "80000000"
+            )
+        ):
+            return "无法识别发言者身份，请使用个人账号发送命令。"
         if action not in {
             "login",
             "password",
@@ -102,7 +124,12 @@ class Main(Star):
             "reset",
         }:
             return "用法：/cam [login|password|web|status|logout|run|reset]；省略操作时执行一次校园跑。"
-        identity = json.dumps([event.get_platform_id(), event.get_sender_id()])
+        dm = None
+        if not private and action in {"login", "web", "password"}:
+            if action == "password" or event.get_platform_name() != "aiocqhttp":
+                return f"请私聊机器人发送 /cam {action} 完成登录。绑定后可回群使用。"
+            dm = f"{event.get_platform_id()}:FriendMessage:{sender}"
+        identity = json.dumps([event.get_platform_id(), sender])
         user_key = "user:" + hashlib.sha256(identity.encode()).hexdigest()
         lock = self.user_locks.setdefault(user_key, asyncio.Lock())
         if lock.locked():
@@ -116,6 +143,28 @@ class Main(Star):
                     if action == "login":
 
                         async def send_image(png: bytes):
+                            if dm:
+                                prompt = event.plain_result(
+                                    "请使用华中科技大学企业微信扫描此二维码，3 分钟内有效，仅供本人使用。"
+                                )
+                                prompt.chain.append(Image.fromBytes(png))
+                                try:
+                                    delivered = await self.context.send_message(
+                                        dm, prompt
+                                    )
+                                except Exception:
+                                    delivered = False
+                                if not delivered:
+                                    raise CampusLoginError(
+                                        "dm_failed",
+                                        "二维码私发失败，请私聊机器人发送 /cam login。",
+                                    )
+                                await event.send(
+                                    event.make_result()
+                                    .at(event.get_sender_name(), sender)
+                                    .message(" 二维码已私发，请查看机器人私聊。")
+                                )
+                                return
                             await event.send(
                                 event.plain_result(
                                     "请使用华中科技大学企业微信扫描下方二维码，3 分钟内完成登录。二维码仅供本人使用。"
@@ -138,7 +187,7 @@ class Main(Star):
                         )
                     return await self._login(event, user_key)
                 if action == "web":
-                    return await self.web_login.issue(event, user_key)
+                    return await self.web_login.issue(event, user_key, dm)
                 if action == "logout":
                     await self.web_login.revoke(user_key)
                     await self.delete_kv_data(user_key)
@@ -176,16 +225,22 @@ class Main(Star):
                             if previous
                             else "尚无运行记录。"
                         )
+                        if not private:
+                            return "你的账号登录有效。" + (
+                                f"上次操作阶段 {previous['phase']}。"
+                                if previous
+                                else "尚无运行记录。"
+                            )
                         return f"账号 {masked} 登录有效。{detail}"
                     if action == "reset":
                         await self.delete_kv_data(account_key)
                         return "已清除上次提交标记。请确认校园跑客户端中的记录后，再发送 /cam run。"
                     if previous and previous["phase"] != "complete":
                         return (
-                            f"上次操作 {previous['sport_id']} 停留在 {previous['phase']} 阶段，"
+                            f"上次操作停留在 {previous['phase']} 阶段，"
                             "可能已部分提交。请先在校园跑客户端核查记录；确认可重新提交后发送 /cam reset。"
                         )
-                    return await self._run(account, account_key)
+                    return await self._run(account, account_key, private)
         except PermissionError:
             await self.delete_kv_data(user_key)
             return "登录已失效，请私聊发送 /cam login。"
@@ -414,12 +469,13 @@ class Main(Star):
             user_key, self.cipher.encrypt(json.dumps(account).encode()).decode()
         )
 
-    async def _run(self, account: dict, account_key: str) -> str:
+    async def _run(self, account: dict, account_key: str, private: bool = True) -> str:
         """Submit one activity and persist progress before side effects.
 
         Args:
             account: Decrypted credentials for the invoking user.
             account_key: Shared activity state key for this campus account.
+            private: Include the activity ID in private replies.
 
         Returns:
             Submission responses or an actionable failure message.
@@ -457,6 +513,7 @@ class Main(Star):
             ):
                 return "校园服务未返回有效的运动编号，无法提交。"
             sport_id = str(sport_id)
+            activity_label = f"运动编号 {sport_id}，" if private else ""
             data["sportId"] = sport_id
             activity, sensor_zip = await asyncio.to_thread(
                 encode_activity, data, sensor, account["secret"]
@@ -474,7 +531,7 @@ class Main(Star):
                 or saved.get("success") is False
             ):
                 return (
-                    f"运动编号 {sport_id}，轨迹提交返回码 {saved.get('code', '未知')}，"
+                    f"{activity_label}轨迹提交返回码 {saved.get('code', '未知')}，"
                     "提交结果尚未确认。请先在校园跑客户端核查记录。"
                 )
             uploaded = await client.request(
@@ -493,7 +550,7 @@ class Main(Star):
             await self.put_kv_data(account_key, progress)
             # Only expose status fields, never echo arbitrary user data or tokens.
             return (
-                f"运动编号 {sport_id}，已收到轨迹提交和传感器上传响应。"
+                f"{activity_label}已收到轨迹提交和传感器上传响应。"
                 f"轨迹返回码 {saved.get('code', '未知')}，"
                 f"传感器返回码 {uploaded.get('code', '未知')}。"
                 "请在校园跑客户端查看审核和有效成绩。"

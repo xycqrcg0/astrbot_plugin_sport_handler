@@ -74,12 +74,15 @@ class WorkerLogin:
             raise ValueError("Invalid relay response")
         return result
 
-    async def issue(self, event: AstrMessageEvent, user_key: str) -> str:
+    async def issue(
+        self, event: AstrMessageEvent, user_key: str, dm: str | None = None
+    ) -> str:
         """Create a campus captcha and publish a user-bound login ticket.
 
         Args:
-            event: Private bot event that initiated login.
+            event: Bot event that initiated login.
             user_key: Trusted platform user identity.
+            dm: Private delivery session when invoked from a group.
 
         Returns:
             One-time link or a configuration error.
@@ -128,7 +131,7 @@ class WorkerLogin:
             )
             pending = PendingLogin(
                 user_key,
-                event.unified_msg_origin,
+                dm or event.unified_msg_origin,
                 session,
                 form,
                 key,
@@ -142,7 +145,19 @@ class WorkerLogin:
         finally:
             self.issuing -= 1
         # A URL fragment keeps the ticket out of HTTP URLs and access logs.
-        return f"请打开专属链接登录，3 分钟内有效，仅限本人使用，请勿转发：\n{self.url}/#{ticket}"
+        link = f"请打开专属链接登录，3 分钟内有效，仅限本人使用，请勿转发：\n{self.url}/#{ticket}"
+        if dm:
+            try:
+                delivered = await self.plugin.context.send_message(
+                    dm, MessageChain().message(link)
+                )
+            except Exception:
+                delivered = False
+            if not delivered:
+                await self.revoke(user_key)
+                return "登录链接私发失败，请私聊机器人发送 /cam web。"
+            return "登录链接已私发，请查看机器人私聊。"
+        return link
 
     async def _wait(self, ticket: str, pending: PendingLogin) -> None:
         """Poll a ticket and cache completion so retries never repeat CAS login.
